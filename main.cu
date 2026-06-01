@@ -1,3 +1,6 @@
+#define GLFW_INCLUDE_NONE 
+#include "glad.h"
+#include <GLFW/glfw3.h>
 #include <libraw/libraw.h>
 #include <nppi.h>
 #include <nppi_color_conversion.h>
@@ -11,6 +14,42 @@
 #include "stb_image_write.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <cuda_gl_interop.h>
+
+float vertices[] = {
+    // positions          // texture coords
+     1.0f,  1.0f, 0.0f,   1.0f, 1.0f,   // top right
+     1.0f, -1.0f, 0.0f,   1.0f, 0.0f,   // bottom right
+    -1.0f, -1.0f, 0.0f,   0.0f, 0.0f,   // bottom left
+    -1.0f,  1.0f, 0.0f,   0.0f, 1.0f    // top left 
+};
+unsigned int indices[] = {  
+    0, 1, 3, // first triangle
+    1, 2, 3  // second triangle
+};
+
+const char* vs = R"(#version 330 core
+layout (location = 0) in vec3 aPos;
+layout (location = 1) in vec2 aTexCoord;
+
+out vec2 TexCoord;
+
+void main() {
+    gl_Position = vec4(aPos, 1.0);
+    TexCoord = aTexCoord;
+})";
+
+const char* fs = R"(#version 330 core
+out vec4 FragColor;
+
+in vec2 TexCoord;
+
+// The texture sampler uniform linked to texture unit 0
+uniform sampler2D ourTexture; 
+
+void main() {
+    FragColor = texture(ourTexture, TexCoord);
+})";
 
 NppiBayerGridPosition get_bayer_type_fast(const LibRaw& rawProcessor) {
     unsigned int filters = rawProcessor.imgdata.idata.filters;
@@ -35,39 +74,69 @@ NppiBayerGridPosition get_bayer_type_fast(const LibRaw& rawProcessor) {
                              " c11=" + std::to_string(c11));
 }
 
-__global__ void gammaKernel(
-    float* img,
-    int width,
-    int height,
-    int stepBytes,
-    float gamma)
-{
+__global__ void process_effects(float* image, int stepBytes, cudaSurfaceObject_t surface, int w, int h, float exposure, float gamma) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x >= width || y >= height)
+    
+    if (x >= w || y >= h)
         return;
 
-    float* row = (float*)((char*)img + y * stepBytes);
+    float* row = (float*)((char*)image + y * stepBytes);
     int idx = x * 3;
 
-    // Clamp first, then gamma — handles highlight magenta in one kernel
-    float r = fminf(1.0f, fmaxf(0.0f, row[idx + 0]));
-    float g = fminf(1.0f, fmaxf(0.0f, row[idx + 1]));
-    float b = fminf(1.0f, fmaxf(0.0f, row[idx + 2]));
+    // Load values
+    float r = row[idx + 0];
+    float g = row[idx + 1];
+    float b = row[idx + 2];
+    
+    // Exposure
+    r *= exp2f(exposure);
+    g *= exp2f(exposure);
+    b *= exp2f(exposure);
 
-    row[idx + 0] = powf(r, gamma);
-    row[idx + 1] = powf(g, gamma);
-    row[idx + 2] = powf(b, gamma);
+    // Gamma Correction
+    
+    float gR = powf(fminf(1.0f, fmaxf(0.0f, r)), gamma);
+    float gG = powf(fminf(1.0f, fmaxf(0.0f, g)), gamma);
+    float gB = powf(fminf(1.0f, fmaxf(0.0f, b)), gamma);
+
+    uchar4 out;
+    out.x = __float2uint_rn(gR * 255.0f);
+    out.y = __float2uint_rn(gG * 255.0f);
+    out.z = __float2uint_rn(gB * 255.0f);
+    out.w = 255;
+
+    surf2Dwrite(out, surface, x * sizeof(uchar4), h - y - 1);
 }
 
 int main(int argc, char* argv[]) {
+    if (!glfwInit()) {
+        return -1;
+    }
+
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(800, 600, "NEF preview", NULL, NULL);
+    if (!window) {
+        glfwTerminate();
+        return -1;
+    }
+    
+    glfwMakeContextCurrent(window);
+
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cout << "Failed to initialize GLAD v1\n";
+        return -1;
+    }
 
     LibRaw rawProcessor;
 
     int result = rawProcessor.open_file("DSC_9269.NEF");
     if(result != LIBRAW_SUCCESS) {
         std::cerr << "Failed to open RAW file!" << std::endl;
+        glfwTerminate();
         return -1;
     }
 
@@ -77,6 +146,7 @@ int main(int argc, char* argv[]) {
     result = rawProcessor.unpack();
     if(result != LIBRAW_SUCCESS) {
         std::cerr << "Unpack failed!" << std::endl;
+        glfwTerminate();
         return -1;
     }
 
@@ -176,6 +246,8 @@ int main(int argc, char* argv[]) {
         streamCtx
     );
 
+    nppiFree(d_rawAligned);
+
     // scale 16u -> 8u
     nppiScale_16u8u_C3R_Ctx(
         d_rgb16, rgb16Step,
@@ -193,54 +265,144 @@ int main(int argc, char* argv[]) {
 
     nppiScale_8u32f_C3R_Ctx(d_rgbAligned, dstStep, pDeviceRGB_32f, nStep32f, srcSize, 0.0f, 1.0f, streamCtx);
 
+    nppiFree(d_rgbAligned);
+
     nppiColorTwist_32f_C3R_Ctx(pDeviceRGB_32f, nStep32f, pDeviceRGB_32f, nStep32f, srcSize, aCombinedTwist,streamCtx);
+
+    // get exec time
+    cudaEventRecord(stop, stream);
+    cudaStreamSynchronize(stream);
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    std::cout << "NPP Debayer and Post-Processing Execution Time: " << milliseconds << " ms" << std::endl;
+
+    // clean up left over cuda
+    cudaStreamDestroy(stream);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    // create gl quad for render and compile shader
+    unsigned int VAO, VBO, EBO;
+    glGenVertexArrays(1, &VAO);
+    glGenBuffers(1, &VBO);
+    glGenBuffers(1, &EBO);
+
+    glBindVertexArray(VAO);
+
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+
+    GLuint shaderProgram;
+    GLuint vertexShader, fragmentShader;
+
+    vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+
+    glShaderSource(vertexShader, 1, &vs, NULL);
+    glShaderSource(fragmentShader, 1, &fs, NULL);
+
+    glCompileShader(vertexShader);
+    glCompileShader(fragmentShader);
+
+    shaderProgram = glCreateProgram();
+    glAttachShader(shaderProgram, vertexShader);
+    glAttachShader(shaderProgram, fragmentShader);
+    glLinkProgram(shaderProgram);
+
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    // create gl texture, bind with cuda and copy data
+    GLuint texture;
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+
+    glTexImage2D(
+        GL_TEXTURE_2D,
+        0,
+        GL_RGBA8,
+        width,
+        height,
+        0,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        nullptr
+    );
+
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);	
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
     
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    static cudaGraphicsResource* cudaResource;
+    cudaArray_t cuArray;
+
+    cudaGraphicsGLRegisterImage(&cudaResource, texture, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
+
+    cudaGraphicsMapResources(1, &cudaResource, 0);
+    cudaGraphicsSubResourceGetMappedArray(&cuArray, cudaResource, 0, 0);
+
+    cudaResourceDesc resDesc = {};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = cuArray;
+
+    cudaSurfaceObject_t surface = 0;
+    cudaCreateSurfaceObject(&surface, &resDesc);
+
     dim3 threads(32, 32);
     dim3 blocks(
         (width + threads.x - 1) / threads.x,
         (height + threads.y - 1) / threads.y
     );
 
-    gammaKernel<<<blocks, threads>>>(
-        pDeviceRGB_32f,
-        width,
-        height,
-        nStep32f,
-        0.4545f
-    );
+    process_effects<<<blocks, threads>>>(pDeviceRGB_32f, nStep32f, surface, width, height, 0.7f, 0.4545f);
 
-    nppiScale_32f8u_C3R_Ctx(pDeviceRGB_32f, nStep32f, d_rgbAligned, dstStep, srcSize, 0.0f, 1.0f, streamCtx);
-    
+    cudaDestroySurfaceObject(surface);
+    cudaGraphicsUnmapResources(1, &cudaResource, 0);
+
+    glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
+
+    auto textureRef = glGetUniformLocation(shaderProgram, "ourTexture");
+
+    while (!glfwWindowShouldClose(window)) {
+        glClear(GL_COLOR_BUFFER_BIT);
+
+        glUseProgram(shaderProgram);
+        glActiveTexture(GL_TEXTURE0);
+
+        glBindTexture(GL_TEXTURE_2D, texture);
+
+        glUniform1i(textureRef, 0); 
+
+        glBindVertexArray(VAO);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+        glBindVertexArray(0);
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
     nppiFree(pDeviceRGB_32f);
 
-    cudaEventRecord(stop, stream);
+    glDeleteVertexArrays(1, &VAO);
+    glDeleteBuffers(1, &VBO);
+    glDeleteBuffers(1, &EBO);
 
-    cudaStreamSynchronize(stream);
-
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    std::cout << "NPP Execution Time: " << milliseconds << " ms" << std::endl;
-
-    uchar3* h_rgb = (uchar3*)malloc(pixel_count * sizeof(uchar3));
-
-    cudaMemcpy2D(
-        h_rgb, width * sizeof(uchar3),
-        d_rgbAligned, dstStep,
-        width * sizeof(uchar3),
-        height,
-        cudaMemcpyDeviceToHost
-    );
-
-    nppiFree(d_rawAligned);
-    nppiFree(d_rgbAligned);
-
-    stbi_write_png("out.png", width, height, 3, (unsigned char*)h_rgb, width * sizeof(uchar3));
-
-    free(h_rgb);
-
-    cudaStreamDestroy(stream);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    glfwTerminate();
 
     return 0;
 }
