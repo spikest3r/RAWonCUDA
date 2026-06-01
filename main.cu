@@ -80,29 +80,6 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    printf("=== RAW METADATA ===\n");
-printf("raw_width=%d raw_height=%d\n", 
-    rawProcessor.imgdata.sizes.raw_width,
-    rawProcessor.imgdata.sizes.raw_height);
-printf("width=%d height=%d\n", 
-    rawProcessor.imgdata.sizes.width,
-    rawProcessor.imgdata.sizes.height);
-printf("left_margin=%d top_margin=%d\n",
-    rawProcessor.imgdata.sizes.left_margin,
-    rawProcessor.imgdata.sizes.top_margin);
-printf("raw_pitch=%d\n",
-    rawProcessor.imgdata.sizes.raw_pitch);
-printf("black=%d maximum=%d\n",
-    rawProcessor.imgdata.color.black,
-    rawProcessor.imgdata.color.maximum);
-printf("cam_mul: R=%.4f G=%.4f B=%.4f G2=%.4f\n",
-    rawProcessor.imgdata.color.cam_mul[0],
-    rawProcessor.imgdata.color.cam_mul[1],
-    rawProcessor.imgdata.color.cam_mul[2],
-    rawProcessor.imgdata.color.cam_mul[3]);
-printf("filters=0x%08X\n",
-    rawProcessor.imgdata.idata.filters);
-
     // get dimensions and prepare array
     int width = rawProcessor.imgdata.sizes.width;
     int height = rawProcessor.imgdata.sizes.height;
@@ -164,17 +141,23 @@ printf("filters=0x%08X\n",
         cudaMemcpyHostToDevice
     );
 
-    printf("srcStep(NPP)=%d  raw_pitch=%d  match=%s\n",
-    srcStep,
-    rawProcessor.imgdata.sizes.raw_pitch,  // print before recycle()!
-    srcStep == rawProcessor.imgdata.sizes.raw_pitch ? "YES" : "NO");
-
     rawProcessor.recycle();
 
     // debayer on gpu
     NppiSize srcSize = { width, height };
     NppiRect srcROI  = { 0, 0, width, height };
+
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+
     NppStreamContext streamCtx = {};  // zero-init = default stream
+    streamCtx.hStream = stream;
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start, stream);
 
     Npp16u* d_rgb16 = nullptr;
     int rgb16Step;
@@ -210,16 +193,9 @@ printf("filters=0x%08X\n",
 
     nppiScale_8u32f_C3R_Ctx(d_rgbAligned, dstStep, pDeviceRGB_32f, nStep32f, srcSize, 0.0f, 1.0f, streamCtx);
 
-    printf("=== COLOR TWIST MATRIX ===\n");
-printf("  %.4f %.4f %.4f  offset=%.4f\n", t00, t01, t02, offset0);
-printf("  %.4f %.4f %.4f  offset=%.4f\n", t10, t11, t12, offset1);
-printf("  %.4f %.4f %.4f  offset=%.4f\n", t20, t21, t22, offset2);
-printf("r_gain=%.4f g_gain=%.4f b_gain=%.4f\n", r_gain, g_gain, b_gain);
-printf("bl=%.4f wh=%.4f stretch=%.4f\n", bl, wh, stretch);
-
     nppiColorTwist_32f_C3R_Ctx(pDeviceRGB_32f, nStep32f, pDeviceRGB_32f, nStep32f, srcSize, aCombinedTwist,streamCtx);
     
-    dim3 threads(16, 16);
+    dim3 threads(32, 32);
     dim3 blocks(
         (width + threads.x - 1) / threads.x,
         (height + threads.y - 1) / threads.y
@@ -237,6 +213,14 @@ printf("bl=%.4f wh=%.4f stretch=%.4f\n", bl, wh, stretch);
     
     nppiFree(pDeviceRGB_32f);
 
+    cudaEventRecord(stop, stream);
+
+    cudaStreamSynchronize(stream);
+
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    std::cout << "NPP Execution Time: " << milliseconds << " ms" << std::endl;
+
     uchar3* h_rgb = (uchar3*)malloc(pixel_count * sizeof(uchar3));
 
     cudaMemcpy2D(
@@ -253,6 +237,10 @@ printf("bl=%.4f wh=%.4f stretch=%.4f\n", bl, wh, stretch);
     stbi_write_png("out.png", width, height, 3, (unsigned char*)h_rgb, width * sizeof(uchar3));
 
     free(h_rgb);
+
+    cudaStreamDestroy(stream);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 
     return 0;
 }
