@@ -156,6 +156,31 @@ __global__ void c3_to_c4(const float* src, int srcPitch,
     row_dst[x + 3] = p3;
 }
 
+__global__ void scale_16u32f_C3R_kernel(
+    const unsigned short* __restrict__ pSrc, int srcStepBytes,
+    float* __restrict__ pDst, int dstStepBytes,
+    int width, int height,
+    float nMin, float nMax) 
+{
+    // Calculate global thread coordinates
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height) {
+        const unsigned short* srcRow = (const unsigned short*)((const char*)pSrc + y * srcStepBytes);
+        float* dstRow = (float*)((char*)pDst + y * dstStepBytes);
+
+        int srcIdx = x * 3;
+        int dstIdx = x * 3;
+
+        float scale = (nMax - nMin) / 65535.0f;
+
+        dstRow[dstIdx + 0] = ((float)srcRow[srcIdx + 0] * scale) + nMin; // Red
+        dstRow[dstIdx + 1] = ((float)srcRow[srcIdx + 1] * scale) + nMin; // Green
+        dstRow[dstIdx + 2] = ((float)srcRow[srcIdx + 2] * scale) + nMin; // Blue
+    }
+}
+
 int main(int argc, char* argv[]) {
     if (!glfwInit()) {
         return -1;
@@ -253,11 +278,10 @@ int main(int argc, char* argv[]) {
 
     auto debayerType = get_bayer_type_fast(rawProcessor);
 
-    int srcStep, dstStep;
+    int srcStep;
 
     Npp16u* d_rawAligned = nppiMalloc_16u_C1(width, height, &srcStep);
-    Npp8u*  d_rgbAligned = nppiMalloc_8u_C3(width, height, &dstStep);
-
+    
     cudaMemcpy2D(
         d_rawAligned, srcStep,
         pRealImage,   rawProcessor.imgdata.sizes.raw_width * sizeof(unsigned short),
@@ -302,30 +326,9 @@ int main(int argc, char* argv[]) {
 
     nppiFree(d_rawAligned);
 
-    // scale 16u -> 8u
-    nppiScale_16u8u_C3R_Ctx(
-        d_rgb16, rgb16Step,
-        d_rgbAligned, dstStep,
-        srcSize,
-        NPP_ALG_HINT_NONE,
-        streamCtx
-    );
-
-    nppiFree(d_rgb16);
-
     Npp32f* pDeviceRGB_32f;
     int nStep32f;
     pDeviceRGB_32f = nppiMalloc_32f_C3(width, height, &nStep32f);
-
-    nppiScale_8u32f_C3R_Ctx(d_rgbAligned, dstStep, pDeviceRGB_32f, nStep32f, srcSize, 0.0f, 1.0f, streamCtx);
-
-    nppiFree(d_rgbAligned);
-
-    nppiColorTwist_32f_C3R_Ctx(pDeviceRGB_32f, nStep32f, pDeviceRGB_32f, nStep32f, srcSize, aCombinedTwist,streamCtx);
-
-    Npp32f* pDeviceRGBA_32f;
-    int nStepRGBA32f;
-    pDeviceRGBA_32f = nppiMalloc_32f_C4(width, height, &nStepRGBA32f);
 
     dim3 threads(32, 16);
     dim3 blocks(
@@ -333,10 +336,24 @@ int main(int argc, char* argv[]) {
         (height + threads.y - 1) / threads.y
     );
 
+    // more precision for float, better color range and image quality
+    scale_16u32f_C3R_kernel<<<blocks, threads, 0, stream>>>(
+        d_rgb16, rgb16Step, 
+        pDeviceRGB_32f, nStep32f, 
+        width, height, 
+        0.0f, 1.0f
+    );
+    
+    nppiColorTwist_32f_C3R_Ctx(pDeviceRGB_32f, nStep32f, pDeviceRGB_32f, nStep32f, srcSize, aCombinedTwist,streamCtx);
+
+    Npp32f* pDeviceRGBA_32f;
+    int nStepRGBA32f;
+    pDeviceRGBA_32f = nppiMalloc_32f_C4(width, height, &nStepRGBA32f);
+
     dim3 grid1((width / 4 + threads.x - 1) / threads.x,
             (height     + threads.y - 1) / threads.y);
 
-    c3_to_c4<<<grid1, threads>>>(pDeviceRGB_32f, nStep32f, pDeviceRGBA_32f, nStepRGBA32f, width, height);
+    c3_to_c4<<<grid1, threads, 0, stream>>>(pDeviceRGB_32f, nStep32f, pDeviceRGBA_32f, nStepRGBA32f, width, height);
 
     nppiFree(pDeviceRGB_32f);
 
@@ -434,6 +451,8 @@ int main(int argc, char* argv[]) {
 
     auto textureRef = glGetUniformLocation(shaderProgram, "ourTexture");
 
+    stbi_flip_vertically_on_write(1);
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -485,6 +504,37 @@ int main(int argc, char* argv[]) {
             snprintf(buf, 32, "%f", saturation);
             if(ImGui::SliderFloat("Saturation", &saturation, -1.0f, 2.0f, buf)) {
                 update = true;
+            }
+            if(ImGui::Button("Export to PNG")) {
+                cudaGraphicsMapResources(1, &cudaResource, 0);
+
+                cudaArray_t cuArray;
+                cudaGraphicsSubResourceGetMappedArray(
+                    &cuArray,
+                    cudaResource,
+                    0,
+                    0
+                );
+
+                uchar4* hostBuffer = (uchar4*)malloc(width * height * sizeof(uchar4));
+
+                size_t dstPitch = width * sizeof(uchar4);
+
+                cudaMemcpy2DFromArray(
+                    hostBuffer,               // dst host ptr
+                    dstPitch,                 // dst pitch
+                    cuArray,                  // src cudaArray
+                    0, 0,                     // x,y offset in array
+                    width * sizeof(uchar4),   // width in bytes
+                    height,                   // height
+                    cudaMemcpyDeviceToHost
+                );
+
+                cudaGraphicsUnmapResources(1, &cudaResource, 0);
+
+                stbi_write_png("out.png", width, height, 4, (unsigned char*)hostBuffer, width * sizeof(uchar4));
+
+                free(hostBuffer);
             }
             ImGui::End();
         }
