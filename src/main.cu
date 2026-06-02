@@ -15,6 +15,14 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cuda_gl_interop.h>
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include "helper_math.h"
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    glViewport(0, 0, width, height);
+}
 
 float vertices[] = {
     // positions          // texture coords
@@ -74,32 +82,40 @@ NppiBayerGridPosition get_bayer_type_fast(const LibRaw& rawProcessor) {
                              " c11=" + std::to_string(c11));
 }
 
-__global__ void process_effects(float* image, int stepBytes, cudaSurfaceObject_t surface, int w, int h, float exposure, float gamma) {
+__global__ void process_effects(float* image, int stepBytes, cudaSurfaceObject_t surface, int w, int h, float exposure, float contrast, float fH, float fS, float gamma, float saturation) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     
     if (x >= w || y >= h)
         return;
 
-    float* row = (float*)((char*)image + y * stepBytes);
-    int idx = x * 3;
-
-    // Load values
-    float r = row[idx + 0];
-    float g = row[idx + 1];
-    float b = row[idx + 2];
+    float4* row = (float4*)((char*)image + y * stepBytes);
+    float4 pixel = row[x];
     
     // Exposure
-    r *= exp2f(exposure);
-    g *= exp2f(exposure);
-    b *= exp2f(exposure);
+    pixel = pixel * exp2f(exposure);
+
+    // Shadows & Highlights
+    float L = pixel.x * 0.299f + pixel.y * 0.587f + pixel.z * 0.114f;
+
+    float shadowMask    = 1.0f - smoothstep(0.0f, 0.75f, L);
+    float highlightMask = smoothstep(0.25f, 1.0f, L);
+
+    float scale = 1.0f + fS * shadowMask + fH * highlightMask;
+    pixel = pixel * scale;
+
+    // Contrast
+    pixel = (pixel - 0.5f) * contrast + 0.5f;
+
+    // Saturation
+    pixel = L + (pixel - L) * saturation;
 
     // Gamma Correction
-    
-    float gR = powf(fminf(1.0f, fmaxf(0.0f, r)), gamma);
-    float gG = powf(fminf(1.0f, fmaxf(0.0f, g)), gamma);
-    float gB = powf(fminf(1.0f, fmaxf(0.0f, b)), gamma);
+    float gR = powf(fminf(1.0f, fmaxf(0.0f, pixel.x)), gamma);
+    float gG = powf(fminf(1.0f, fmaxf(0.0f, pixel.y)), gamma);
+    float gB = powf(fminf(1.0f, fmaxf(0.0f, pixel.z)), gamma);
 
+    // float to uchar
     uchar4 out;
     out.x = __float2uint_rn(gR * 255.0f);
     out.y = __float2uint_rn(gG * 255.0f);
@@ -107,6 +123,37 @@ __global__ void process_effects(float* image, int stepBytes, cudaSurfaceObject_t
     out.w = 255;
 
     surf2Dwrite(out, surface, x * sizeof(uchar4), h - y - 1);
+}
+
+__global__ void c3_to_c4(const float* src, int srcPitch,
+                          float* dst, int dstPitch,
+                          int width, int height)
+{
+    // each thread processes 4 pixels
+    int x = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    int y =  blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    // src row as float4 pointer — 3 float4 reads = 4 pixels (12 floats)
+    const float4* row_src = (const float4*)((const char*)src + y * srcPitch);
+    float4*       row_dst = (float4*)      ((char*)      dst + y * dstPitch);
+
+    // 3 coalesced 128-bit loads
+    float4 c0 = row_src[(x * 3) / 4 + 0];  // R0 G0 B0 R1
+    float4 c1 = row_src[(x * 3) / 4 + 1];  // G1 B1 R2 G2
+    float4 c2 = row_src[(x * 3) / 4 + 2];  // B2 R3 G3 B3
+
+    // unpack 4 pixels
+    float4 p0 = { c0.x, c0.y, c0.z, 1.0f };
+    float4 p1 = { c0.w, c1.x, c1.y, 1.0f };
+    float4 p2 = { c1.z, c1.w, c2.x, 1.0f };
+    float4 p3 = { c2.y, c2.z, c2.w, 1.0f };
+
+    // 4 coalesced 128-bit stores
+    row_dst[x + 0] = p0;
+    row_dst[x + 1] = p1;
+    row_dst[x + 2] = p2;
+    row_dst[x + 3] = p3;
 }
 
 int main(int argc, char* argv[]) {
@@ -118,7 +165,7 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(800, 600, "NEF preview", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(960, 640, "NEF preview", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
@@ -130,6 +177,15 @@ int main(int argc, char* argv[]) {
         std::cout << "Failed to initialize GLAD v1\n";
         return -1;
     }
+
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
 
     LibRaw rawProcessor;
 
@@ -161,8 +217,6 @@ int main(int argc, char* argv[]) {
     unsigned short* pRealImage = rawProcessor.imgdata.rawdata.raw_image +
                                 top_margin * raw_stride + left_margin;
                                  
-    size_t pixel_count = (size_t)width * height;
-
     float r_gain = rawProcessor.imgdata.color.cam_mul[0] / rawProcessor.imgdata.color.cam_mul[1];
     float g_gain = 1.0f;
     float b_gain = rawProcessor.imgdata.color.cam_mul[2] / rawProcessor.imgdata.color.cam_mul[1];
@@ -269,6 +323,23 @@ int main(int argc, char* argv[]) {
 
     nppiColorTwist_32f_C3R_Ctx(pDeviceRGB_32f, nStep32f, pDeviceRGB_32f, nStep32f, srcSize, aCombinedTwist,streamCtx);
 
+    Npp32f* pDeviceRGBA_32f;
+    int nStepRGBA32f;
+    pDeviceRGBA_32f = nppiMalloc_32f_C4(width, height, &nStepRGBA32f);
+
+    dim3 threads(32, 16);
+    dim3 blocks(
+        (width + threads.x - 1) / threads.x,
+        (height + threads.y - 1) / threads.y
+    );
+
+    dim3 grid1((width / 4 + threads.x - 1) / threads.x,
+            (height     + threads.y - 1) / threads.y);
+
+    c3_to_c4<<<grid1, threads>>>(pDeviceRGB_32f, nStep32f, pDeviceRGBA_32f, nStepRGBA32f, width, height);
+
+    nppiFree(pDeviceRGB_32f);
+
     // get exec time
     cudaEventRecord(stop, stream);
     cudaStreamSynchronize(stream);
@@ -352,33 +423,73 @@ int main(int argc, char* argv[]) {
 
     cudaGraphicsGLRegisterImage(&cudaResource, texture, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
 
-    cudaGraphicsMapResources(1, &cudaResource, 0);
-    cudaGraphicsSubResourceGetMappedArray(&cuArray, cudaResource, 0, 0);
-
-    cudaResourceDesc resDesc = {};
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = cuArray;
-
-    cudaSurfaceObject_t surface = 0;
-    cudaCreateSurfaceObject(&surface, &resDesc);
-
-    dim3 threads(32, 32);
-    dim3 blocks(
-        (width + threads.x - 1) / threads.x,
-        (height + threads.y - 1) / threads.y
-    );
-
-    process_effects<<<blocks, threads>>>(pDeviceRGB_32f, nStep32f, surface, width, height, 0.7f, 0.4545f);
-
-    cudaDestroySurfaceObject(surface);
-    cudaGraphicsUnmapResources(1, &cudaResource, 0);
+    bool update = true; // first frame
+    float exposure = 0.0f;
+    float contrast = 1.0f;
+    float factorH = 1.0f;
+    float factorS = 1.0f;
+    float saturation = 1.0f;
 
     glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
 
     auto textureRef = glGetUniformLocation(shaderProgram, "ourTexture");
 
     while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+
+        // compute frame if update flag is set
+        if(update) {
+            update = false;
+
+            cudaGraphicsMapResources(1, &cudaResource, 0);
+            cudaGraphicsSubResourceGetMappedArray(&cuArray, cudaResource, 0, 0);
+
+            cudaResourceDesc resDesc = {};
+            resDesc.resType = cudaResourceTypeArray;
+            resDesc.res.array.array = cuArray;
+
+            cudaSurfaceObject_t surface = 0;
+            cudaCreateSurfaceObject(&surface, &resDesc);
+
+            process_effects<<<blocks, threads>>>(pDeviceRGBA_32f, nStepRGBA32f, surface, width, height, exposure, contrast, factorH, factorS, 0.4545f, saturation);
+
+            cudaDestroySurfaceObject(surface);
+            cudaGraphicsUnmapResources(1, &cudaResource, 0);
+        }
+
         glClear(GL_COLOR_BUFFER_BIT);
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        {
+            ImGui::Begin("Image");
+            char buf[32];
+            snprintf(buf, 32, "%f", exposure);
+            if(ImGui::SliderFloat("Exposure", &exposure, -5.0f, 5.0f, buf)) {
+                update = true;
+            }
+            snprintf(buf, 32, "%f", contrast);
+            if(ImGui::SliderFloat("Contrast", &contrast, 0.0f, 2.0f, buf)) {
+                update = true;
+            }
+            snprintf(buf, 32, "%f", factorH);
+            if(ImGui::SliderFloat("Highlights", &factorH, 0.5f, 3.0f, buf)) {
+                update = true;
+            }
+            snprintf(buf, 32, "%f", factorS);
+            if(ImGui::SliderFloat("Shadows", &factorS, 0.5f, 3.0f, buf)) {
+                update = true;
+            }
+            snprintf(buf, 32, "%f", saturation);
+            if(ImGui::SliderFloat("Saturation", &saturation, -1.0f, 2.0f, buf)) {
+                update = true;
+            }
+            ImGui::End();
+        }
+
+        ImGui::Render();
 
         glUseProgram(shaderProgram);
         glActiveTexture(GL_TEXTURE0);
@@ -392,8 +503,9 @@ int main(int argc, char* argv[]) {
 
         glBindVertexArray(0);
 
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
         glfwSwapBuffers(window);
-        glfwPollEvents();
     }
 
     nppiFree(pDeviceRGB_32f);
@@ -401,6 +513,10 @@ int main(int argc, char* argv[]) {
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
     glDeleteBuffers(1, &EBO);
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
 
     glfwTerminate();
 
