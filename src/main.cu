@@ -10,8 +10,6 @@
 #include <nppi_arithmetic_and_logical_operations.h>
 #include <npp.h>
 #include <iostream>
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cuda_gl_interop.h>
@@ -19,6 +17,9 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "helper_math.h"
+#include <nvjpeg.h>
+#include <fstream>
+#include <nvtx3/nvtx3.hpp>
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -181,7 +182,33 @@ __global__ void scale_16u32f_C3R_kernel(
     }
 }
 
+__global__ void strip_alpha_kernel(
+    const unsigned char* __restrict__ src,
+    unsigned char* __restrict__ dst,
+    int width,
+    int height)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x < width && y < height)
+    {
+        int pixel_idx = y * width + x;
+
+        const uchar4* src_pixels = (const uchar4*)src;
+        
+        int dst_byte_idx = ((height - y) * width + x) * 3; // flip since GL textures are flipped
+
+        uchar4 p = src_pixels[pixel_idx];
+
+        dst[dst_byte_idx + 0] = p.x; // R
+        dst[dst_byte_idx + 1] = p.y; // G
+        dst[dst_byte_idx + 2] = p.z; // B
+    }
+}
+
 int main(int argc, char* argv[]) {
+    nvtxRangePush("Init GLFW");
     if (!glfwInit()) {
         return -1;
     }
@@ -211,7 +238,9 @@ int main(int argc, char* argv[]) {
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
+    nvtxRangePop();
 
+    nvtxRangePush("LibRaw");
     LibRaw rawProcessor;
 
     int result = rawProcessor.open_file("DSC_9269.NEF");
@@ -277,6 +306,9 @@ int main(int argc, char* argv[]) {
     };
 
     auto debayerType = get_bayer_type_fast(rawProcessor);
+    nvtxRangePop();
+
+    nvtxRangePush("debayer_init");
 
     int srcStep;
 
@@ -314,6 +346,7 @@ int main(int argc, char* argv[]) {
     Npp32u shiftVal = 4;
     nppiLShiftC_16u_C1IR_Ctx(shiftVal, d_rawAligned, srcStep, srcSize, streamCtx);
 
+    nvtxRangePush("debayer");
     // debayer 16u -> 16u RGB
     NppStatus status = nppiCFAToRGB_16u_C1C3R_Ctx(
         d_rawAligned, srcStep,
@@ -323,6 +356,7 @@ int main(int argc, char* argv[]) {
         NPPI_INTER_UNDEFINED,
         streamCtx
     );
+    nvtxRangePop();
 
     nppiFree(d_rawAligned);
 
@@ -344,7 +378,9 @@ int main(int argc, char* argv[]) {
         0.0f, 1.0f
     );
     
+    nvtxRangePush("color_twist");
     nppiColorTwist_32f_C3R_Ctx(pDeviceRGB_32f, nStep32f, pDeviceRGB_32f, nStep32f, srcSize, aCombinedTwist,streamCtx);
+    nvtxRangePop();
 
     Npp32f* pDeviceRGBA_32f;
     int nStepRGBA32f;
@@ -356,6 +392,7 @@ int main(int argc, char* argv[]) {
     c3_to_c4<<<grid1, threads, 0, stream>>>(pDeviceRGB_32f, nStep32f, pDeviceRGBA_32f, nStepRGBA32f, width, height);
 
     nppiFree(pDeviceRGB_32f);
+    nvtxRangePop();
 
     // get exec time
     cudaEventRecord(stop, stream);
@@ -365,7 +402,6 @@ int main(int argc, char* argv[]) {
     std::cout << "NPP Debayer and Post-Processing Execution Time: " << milliseconds << " ms" << std::endl;
 
     // clean up left over cuda
-    cudaStreamDestroy(stream);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
@@ -440,6 +476,20 @@ int main(int argc, char* argv[]) {
 
     cudaGraphicsGLRegisterImage(&cudaResource, texture, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard);
 
+    // initialize nvjpeg
+    nvjpegHandle_t nvjpeg_handle;
+    nvjpegEncoderState_t encoder_state;
+    nvjpegEncoderParams_t encoder_params;
+
+    nvjpegCreate(NVJPEG_BACKEND_DEFAULT, NULL, &nvjpeg_handle);
+    nvjpegEncoderStateCreate(nvjpeg_handle, &encoder_state, stream);
+    nvjpegEncoderParamsCreate(nvjpeg_handle, &encoder_params, stream);
+
+    nvjpegEncoderParamsSetQuality(encoder_params, 90, stream);
+
+    nvjpegEncoderParamsSetSamplingFactors(encoder_params, NVJPEG_CSS_444, stream);
+
+    // variables for ui
     bool update = true; // first frame
     float exposure = 0.0f;
     float contrast = 1.0f;
@@ -447,11 +497,9 @@ int main(int argc, char* argv[]) {
     float factorS = 1.0f;
     float saturation = 1.0f;
 
+    // pre loop preparation
     glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
-
     auto textureRef = glGetUniformLocation(shaderProgram, "ourTexture");
-
-    stbi_flip_vertically_on_write(1);
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -505,36 +553,86 @@ int main(int argc, char* argv[]) {
             if(ImGui::SliderFloat("Saturation", &saturation, -1.0f, 2.0f, buf)) {
                 update = true;
             }
-            if(ImGui::Button("Export to PNG")) {
-                cudaGraphicsMapResources(1, &cudaResource, 0);
+            if(ImGui::Button("Export to JPEG")) {
+                unsigned char* d_linearRGB4 = nullptr;
+                unsigned char* d_linearRGB3 = nullptr;
 
+                nvtxRangePush("jpeg_encode_init");
+                cudaMallocAsync((void**)&d_linearRGB4, width * height * 4, stream);
+
+                cudaGraphicsMapResources(1, &cudaResource, stream);
                 cudaArray_t cuArray;
-                cudaGraphicsSubResourceGetMappedArray(
-                    &cuArray,
-                    cudaResource,
-                    0,
-                    0
+                cudaGraphicsSubResourceGetMappedArray(&cuArray, cudaResource, 0, 0);
+
+                cudaMemcpy2DFromArrayAsync(
+                    d_linearRGB4,
+                    width * 4,
+                    cuArray,
+                    0, 0,
+                    width * 4,
+                    height,
+                    cudaMemcpyDeviceToDevice,
+                    stream
                 );
 
-                uchar4* hostBuffer = (uchar4*)malloc(width * height * sizeof(uchar4));
+                cudaGraphicsUnmapResources(1, &cudaResource, stream);
 
-                size_t dstPitch = width * sizeof(uchar4);
+                cudaMallocAsync((void**)&d_linearRGB3, width * height * 3, stream);
 
-                cudaMemcpy2DFromArray(
-                    hostBuffer,               // dst host ptr
-                    dstPitch,                 // dst pitch
-                    cuArray,                  // src cudaArray
-                    0, 0,                     // x,y offset in array
-                    width * sizeof(uchar4),   // width in bytes
-                    height,                   // height
-                    cudaMemcpyDeviceToHost
-                );
+                strip_alpha_kernel<<<blocks, threads, 0, stream>>>(d_linearRGB4, d_linearRGB3, width, height);
 
-                cudaGraphicsUnmapResources(1, &cudaResource, 0);
+                cudaFreeAsync(d_linearRGB4, stream);
 
-                stbi_write_png("out.png", width, height, 4, (unsigned char*)hostBuffer, width * sizeof(uchar4));
+                nvjpegImage_t img_to_encode;
+                img_to_encode.channel[0] = d_linearRGB3;
+                img_to_encode.channel[1] = nullptr;
+                img_to_encode.channel[2] = nullptr;
+                img_to_encode.channel[3] = nullptr;
+                img_to_encode.pitch[0] = width * 3;
+                img_to_encode.pitch[1] = 0;
+                img_to_encode.pitch[2] = 0;
+                img_to_encode.pitch[3] = 0;
 
-                free(hostBuffer);
+                size_t max_stream_length = 0;
+                nvjpegEncodeGetBufferSize(nvjpeg_handle, encoder_params, width, height, &max_stream_length);
+
+                nvjpegStatus_t status;
+
+                nvtxRangePush("nvjpegEncodeImage");
+                status = nvjpegEncodeImage(nvjpeg_handle, encoder_state, encoder_params,
+                                        &img_to_encode, NVJPEG_INPUT_RGBI, width, height, stream);
+                if (status != NVJPEG_STATUS_SUCCESS) {
+                    printf("nvjpegEncodeImage failed with status: %d\n", status);
+                }
+                nvtxRangePop();
+
+                size_t jpeg_size = 0;
+                nvjpegEncodeRetrieveBitstream(nvjpeg_handle, encoder_state, NULL, &jpeg_size, stream); // <-- Correct Name
+                
+                cudaStreamSynchronize(stream);
+
+                unsigned char* h_jpegBuffer = nullptr;
+                cudaHostAlloc((void**)&h_jpegBuffer, jpeg_size, cudaHostAllocDefault);
+
+                nvtxRangePush("nvjpegEncodeRetrieveBitstream");
+                nvjpegEncodeRetrieveBitstream(nvjpeg_handle, encoder_state, h_jpegBuffer, &jpeg_size, stream);
+                nvtxRangePop();
+
+                cudaStreamSynchronize(stream);
+                cudaFreeAsync(d_linearRGB3, stream);
+
+                nvtxRangePush("Write to disk");
+
+                std::ofstream outFile("output.jpg", std::ios::out | std::ios::binary);
+                if (outFile.is_open()) {
+                    outFile.write((char*)h_jpegBuffer, jpeg_size);
+                    outFile.close();
+                }
+
+                nvtxRangePop();
+
+                cudaFreeHost(h_jpegBuffer);
+                nvtxRangePop();
             }
             ImGui::End();
         }
@@ -559,6 +657,8 @@ int main(int argc, char* argv[]) {
     }
 
     nppiFree(pDeviceRGB_32f);
+
+    cudaStreamDestroy(stream);
 
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
