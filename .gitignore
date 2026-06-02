@@ -1,1 +1,6 @@
+*.NEF
+*.png
+*.pp3
+main
+imgui.ini
 .vscode
