@@ -20,6 +20,10 @@
 #include <nvjpeg.h>
 #include <fstream>
 #include <nvtx3/nvtx3.hpp>
+#include <tiffio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
@@ -59,6 +63,70 @@ uniform sampler2D ourTexture;
 void main() {
     FragColor = texture(ourTexture, TexCoord);
 })";
+
+#include <tiffio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define TILE_WIDTH  256
+#define TILE_HEIGHT 256
+
+int write_8bit_tiff_tiled(const char *filename,
+                           const unsigned char *pixels,
+                           uint32_t width,
+                           uint32_t height)
+{
+    TIFF *tif = TIFFOpen(filename, "w");
+    if (!tif) return -1;
+
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH,      width);
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH,     height);
+    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE,   8);
+    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, 4);
+    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC,     PHOTOMETRIC_RGB);
+    TIFFSetField(tif, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG);
+    TIFFSetField(tif, TIFFTAG_COMPRESSION,       COMPRESSION_DEFLATE);
+    TIFFSetField(tif, TIFFTAG_ZIPQUALITY,        6);
+    TIFFSetField(tif, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT);
+    TIFFSetField(tif, TIFFTAG_TILEWIDTH,       TILE_WIDTH);
+    TIFFSetField(tif, TIFFTAG_TILELENGTH,      TILE_HEIGHT);
+    uint16_t extra = EXTRASAMPLE_UNASSALPHA;
+    TIFFSetField(tif, TIFFTAG_EXTRASAMPLES,   1, &extra);
+
+    tmsize_t tile_size = TIFFTileSize(tif);
+    unsigned char *tile_buf = (unsigned char *)malloc(tile_size);
+    if (!tile_buf) { TIFFClose(tif); return -1; }
+
+    for (uint32_t ty = 0; ty < height; ty += TILE_HEIGHT) {
+        for (uint32_t tx = 0; tx < width; tx += TILE_WIDTH) {
+
+            memset(tile_buf, 0, tile_size);
+
+            for (uint32_t row = 0; row < TILE_HEIGHT; row++) {
+                uint32_t img_y = (height - 1) - (ty + row);  /* flip: read from bottom up */
+                if (img_y >= height) break;
+
+                uint32_t copy_w = TILE_WIDTH;
+                if (tx + copy_w > width) copy_w = width - tx;
+
+                memcpy(tile_buf + row * TILE_WIDTH * 4,
+                    pixels + (img_y * width + tx) * 4,
+                    copy_w * 4);
+            }
+
+            if (TIFFWriteTile(tif, tile_buf, tx, ty, 0, 0) < 0) {
+                free(tile_buf);
+                TIFFClose(tif);
+                return -1;
+            }
+        }
+    }
+
+    free(tile_buf);
+    TIFFClose(tif);
+    return 0;
+}
 
 NppiBayerGridPosition get_bayer_type_fast(const LibRaw& rawProcessor) {
     unsigned int filters = rawProcessor.imgdata.idata.filters;
@@ -208,6 +276,11 @@ __global__ void strip_alpha_kernel(
 }
 
 int main(int argc, char* argv[]) {
+    if(argc != 2) {
+        std::cout << "Usage: " << "cudaraw [image.raw]" << std::endl;
+        return -1;
+    }
+
     nvtxRangePush("Init GLFW");
     if (!glfwInit()) {
         return -1;
@@ -217,7 +290,7 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(960, 640, "NEF preview", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(960, 640, "RAW preview", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
@@ -243,7 +316,7 @@ int main(int argc, char* argv[]) {
     nvtxRangePush("LibRaw");
     LibRaw rawProcessor;
 
-    int result = rawProcessor.open_file("DSC_9269.NEF");
+    int result = rawProcessor.open_file(argv[1]);
     if(result != LIBRAW_SUCCESS) {
         std::cerr << "Failed to open RAW file!" << std::endl;
         glfwTerminate();
@@ -321,6 +394,9 @@ int main(int argc, char* argv[]) {
         cudaMemcpyHostToDevice
     );
 
+    int whiteLevel = rawProcessor.imgdata.color.maximum;
+    int depth = (int)floor(log2(whiteLevel + 1)); 
+
     rawProcessor.recycle();
 
     // debayer on gpu
@@ -343,7 +419,7 @@ int main(int argc, char* argv[]) {
     int rgb16Step;
     d_rgb16 = nppiMalloc_16u_C3(width, height, &rgb16Step);
 
-    Npp32u shiftVal = 4;
+    Npp32u shiftVal = (Npp32u)(16 - depth);
     nppiLShiftC_16u_C1IR_Ctx(shiftVal, d_rawAligned, srcStep, srcSize, streamCtx);
 
     nvtxRangePush("debayer");
@@ -496,6 +572,7 @@ int main(int argc, char* argv[]) {
     float factorH = 1.0f;
     float factorS = 1.0f;
     float saturation = 1.0f;
+    bool applyEffects = true;
 
     // pre loop preparation
     glClearColor(1.0f, 0.0f, 0.0f, 1.0f);
@@ -518,7 +595,11 @@ int main(int argc, char* argv[]) {
             cudaSurfaceObject_t surface = 0;
             cudaCreateSurfaceObject(&surface, &resDesc);
 
-            process_effects<<<blocks, threads>>>(pDeviceRGBA_32f, nStepRGBA32f, surface, width, height, exposure, contrast, factorH, factorS, 0.4545f, saturation);
+            if(applyEffects) {
+                process_effects<<<blocks, threads>>>(pDeviceRGBA_32f, nStepRGBA32f, surface, width, height, exposure, contrast, factorH, factorS, 0.4545f, saturation);
+            } else {
+                process_effects<<<blocks, threads>>>(pDeviceRGBA_32f, nStepRGBA32f, surface, width, height, 0.0f, 1.0f, 1.0f, 1.0f, 0.4545f, 1.0f);
+            }
 
             cudaDestroySurfaceObject(surface);
             cudaGraphicsUnmapResources(1, &cudaResource, 0);
@@ -532,6 +613,20 @@ int main(int argc, char* argv[]) {
 
         {
             ImGui::Begin("Image");
+            if(ImGui::Button("Reset to Default")) {
+                exposure = 0.0f;
+                contrast = 1.0f;
+                factorH = 1.0f;
+                factorS = 1.0f;
+                saturation = 1.0f;
+                update = true;
+            }
+            if(ImGui::Button("Toggle effects")) {
+                applyEffects = !applyEffects;
+                update = true;
+            }
+            ImGui::SameLine();
+            ImGui::Text(applyEffects ? "YES" : "NO");
             char buf[32];
             snprintf(buf, 32, "%f", exposure);
             if(ImGui::SliderFloat("Exposure", &exposure, -5.0f, 5.0f, buf)) {
@@ -553,7 +648,7 @@ int main(int argc, char* argv[]) {
             if(ImGui::SliderFloat("Saturation", &saturation, -1.0f, 2.0f, buf)) {
                 update = true;
             }
-            if(ImGui::Button("Export to JPEG")) {
+            if(ImGui::Button("Export to JPEG (CUDA)")) {
                 unsigned char* d_linearRGB4 = nullptr;
                 unsigned char* d_linearRGB3 = nullptr;
 
@@ -632,6 +727,43 @@ int main(int argc, char* argv[]) {
                 nvtxRangePop();
 
                 cudaFreeHost(h_jpegBuffer);
+                nvtxRangePop();
+            }
+            if(ImGui::Button("Export to TIFF (CPU)")) {
+                unsigned char* d_linearRGB4 = nullptr;
+
+                nvtxRangePush("encode_h2d");
+                cudaMalloc((void**)&d_linearRGB4, width * height * 4);
+
+                cudaGraphicsMapResources(1, &cudaResource, 0);
+                cudaArray_t cuArray;
+                cudaGraphicsSubResourceGetMappedArray(&cuArray, cudaResource, 0, 0);
+
+                cudaMemcpy2DFromArrayAsync(
+                    d_linearRGB4,
+                    width * 4,
+                    cuArray,
+                    0, 0,
+                    width * 4,
+                    height,
+                    cudaMemcpyDeviceToDevice,
+                    stream
+                );
+
+                cudaGraphicsUnmapResources(1, &cudaResource, 0);
+
+                unsigned char* h_linearRGB4 = nullptr;
+                cudaHostAlloc((void**)&h_linearRGB4, width * height * 4, cudaHostAllocDefault);
+
+                cudaMemcpy(h_linearRGB4, d_linearRGB4, width * height * 4, cudaMemcpyDeviceToHost);
+
+                cudaFree(d_linearRGB4);
+
+                nvtxRangePush("TIFF on CPU");
+                write_8bit_tiff_tiled("output.tiff", h_linearRGB4, width, height);
+                nvtxRangePop();
+
+                cudaFreeHost(h_linearRGB4);
                 nvtxRangePop();
             }
             ImGui::End();

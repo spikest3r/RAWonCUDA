@@ -1,6 +1,12 @@
 *.NEF
-*.png
 *.pp3
 main
+cudaraw
 imgui.ini
 .vscode
+.ncu-rep
+*.CR3
+*.dng
+*.tiff
+*.arw
+*.raf

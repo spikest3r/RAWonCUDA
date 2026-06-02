@@ -1,1 +1,1 @@
-nvcc -gencode arch=compute_120,code=sm_120 src/glad.c src/main.cu imgui/*.cpp -o main -I/opt/cuda/include -I./include -L/opt/cuda/lib64   -lnppc -lnppicc -lnppial -lnppist -lnppidei -lnppig -lnppisu -lnppim   -lraw -lglfw -lGL -lnvjpeg
+nvcc -gencode arch=compute_120,code=sm_120 src/glad.c src/main.cu imgui/*.cpp -o cudaraw -I/opt/cuda/include -I./include -L/opt/cuda/lib64   -lnppc -lnppicc -lnppial -lnppist -lnppidei -lnppig -lnppisu -lnppim   -lraw -lglfw -lGL -lnvjpeg -ltiff
