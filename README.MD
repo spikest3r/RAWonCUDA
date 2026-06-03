@@ -20,11 +20,9 @@ Run ```./compile``` after installing required dependencies. You will get ```cuda
 
 ## Screenshots
 
-I found great RAW samples on [DPREVIEW](dpreview.com). Used footage is linked under each screenshot and I do not claim rights for any images.
+I found great RAW samples on [DPREVIEW](dpreview.com). Used footage is linked and I do not claim rights for any images.
 
-![Screenshot of an application](image.png)
-
-<video autoplay loop muted playsinline src="video.webm"></video>
+![alt text](picture.gif)
 
 [Phase One IQ4 sample image](https://www.dpreview.com/sample-galleries/5619674350/phase-one-iq4-sample-gallery/4227897306)
 
